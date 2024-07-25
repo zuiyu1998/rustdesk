@@ -3099,6 +3099,7 @@ lazy_static::lazy_static! {
         ("VK_BACKSLASH", Key::Chr('\\' as _)),
         ("VK_MINUS", Key::Chr('-' as _)),
         ("VK_PLUS", Key::Chr('=' as _)), // it is =, but sciter return VK_PLUS
+        ("VK_NUMLOCK", Key::ControlKey(ControlKey::NumLock)), // numpad
         ("VK_DIVIDE", Key::ControlKey(ControlKey::Divide)), // numpad
         ("VK_MULTIPLY", Key::ControlKey(ControlKey::Multiply)), // numpad
         ("VK_SUBTRACT", Key::ControlKey(ControlKey::Subtract)), // numpad

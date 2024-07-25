@@ -428,6 +428,7 @@ const Map<int, String> logicalKeyMap = <int, String>{
   0x0020000022b: 'VK_ADD',
   0x0020000022d: 'VK_SUBTRACT',
   0x0020000022e: 'VK_DECIMAL',
+  0x0010000010a: "VK_NUMLOCK",
   0x0020000022f: 'VK_DIVIDE',
   0x00200000230: 'VK_NUMPAD0',
   0x00200000231: 'VK_NUMPAD1',
@@ -517,7 +518,7 @@ const Map<int, String> physicalKeyMap = <int, String>{
   0x00070050: 'VK_LEFT',
   0x00070051: 'VK_DOWN',
   0x00070052: 'VK_UP',
-  0x00070053: 'Num Lock', // TODO rust not impl
+  0x00070053: 'VK_NUMLOCK',
   0x00070054: 'VK_DIVIDE', // numpad
   0x00070055: 'VK_MULTIPLY',
   0x00070056: 'VK_SUBTRACT',
