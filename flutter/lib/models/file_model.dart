@@ -496,6 +496,32 @@ class FileController {
       debugPrint(
           "path: ${from.path}, toPath: $toPath, to: ${PathUtil.join(toPath, from.name, isWindows)}");
     }
+
+    final List<Entry> emptyDirs = [];
+    for (var item in items.items) {
+      if (item.isDirectory && item.size == 0) {
+        emptyDirs.add(item);
+      }
+    }
+
+    if (emptyDirs.isEmpty) {
+      return;
+    }
+
+    for (var from in emptyDirs) {
+      final jobID = jobController.addTransferJob(from, isRemoteToLocal);
+      bind.sessionSendFiles(
+          sessionId: sessionId,
+          actId: jobID,
+          path: from.path,
+          to: PathUtil.join(toPath, from.name, isWindows),
+          fileNum: 0,
+          includeHidden: showHidden,
+          isRemote: isRemoteToLocal,
+          isDir: from.isDirectory);
+      debugPrint(
+          "path: ${from.path}, toPath: $toPath, to: ${PathUtil.join(toPath, from.name, isWindows)}");
+    }
   }
 
   bool _removeCheckboxRemember = false;
