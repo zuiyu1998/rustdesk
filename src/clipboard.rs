@@ -1,3 +1,6 @@
+mod clipboard_transform;
+mod clipboard_transform_manager;
+
 #[cfg(not(target_os = "android"))]
 use arboard::{ClipboardData, ClipboardFormat};
 #[cfg(not(target_os = "android"))]
