@@ -16,7 +16,7 @@ pub enum ClipboardFormat {
 
 pub struct Clipboard {
     pub format: ClipboardFormat,
-    data: ClipboardData,
+    pub data: ClipboardData,
 }
 
 impl Clipboard {
