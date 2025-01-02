@@ -1,7 +1,10 @@
+pub mod clipboard_transform;
+
 #[cfg(not(target_os = "android"))]
 use arboard::{ClipboardData, ClipboardFormat};
 #[cfg(not(target_os = "android"))]
 use clipboard_master::{ClipboardHandler, Master, Shutdown};
+use clipboard_transform::ClipboardTransformManager;
 use hbb_common::{bail, log, message_proto::*, ResultType};
 use std::{
     sync::{mpsc::Sender, Arc, Mutex},
@@ -203,7 +206,8 @@ pub fn check_clipboard_cm() -> ResultType<MultiClipboards> {
 
 #[cfg(not(target_os = "android"))]
 fn update_clipboard_(multi_clipboards: Vec<Clipboard>, side: ClipboardSide) {
-    let mut to_update_data = proto::from_multi_clipbards(multi_clipboards);
+    let to_update_data = proto::from_multi_clipbards(multi_clipboards);
+
     if to_update_data.is_empty() {
         return;
     }
@@ -220,6 +224,8 @@ fn update_clipboard_(multi_clipboards: Vec<Clipboard>, side: ClipboardSide) {
         }
     }
     if let Some(ctx) = ctx.as_mut() {
+        let mut to_update_data = ctx.manager.transform_data(to_update_data);
+
         to_update_data.push(ClipboardData::Special((
             RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
             side.get_owner_data(),
@@ -243,6 +249,7 @@ pub fn update_clipboard(multi_clipboards: Vec<Clipboard>, side: ClipboardSide) {
 #[cfg(not(any(all(target_os = "linux", feature = "unix-file-copy-paste"))))]
 pub struct ClipboardContext {
     inner: arboard::Clipboard,
+    manager: ClipboardTransformManager,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -279,7 +286,10 @@ impl ClipboardContext {
             }
         }
 
-        Ok(ClipboardContext { inner: board })
+        Ok(ClipboardContext {
+            inner: board,
+            manager: ClipboardTransformManager::default(),
+        })
     }
 
     fn get_formats(&mut self, formats: &[ClipboardFormat]) -> ResultType<Vec<ClipboardData>> {
