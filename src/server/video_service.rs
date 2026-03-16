@@ -49,7 +49,7 @@ use scrap::{
     codec::{Encoder, EncoderCfg},
     record::{Recorder, RecorderContext},
     vpxcodec::{VpxEncoderConfig, VpxVideoCodecId},
-    CodecFormat, Display, EncodeInput, TraitCapturer,
+    CodecFormat, Display, EncodeInput, TraitCapturer, TraitPixelBuffer,
 };
 #[cfg(windows)]
 use std::sync::Once;
@@ -62,29 +62,70 @@ use std::{
 
 pub const OPTION_REFRESH: &'static str = "refresh";
 
+type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
+type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
+
 lazy_static::lazy_static! {
-    static ref FRAME_FETCHED_NOTIFIER: (UnboundedSender<(i32, Option<Instant>)>, Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>) = {
-        let (tx, rx) = unbounded_channel();
-        (tx, Arc::new(TokioMutex::new(rx)))
-    };
+    static ref FRAME_FETCHED_NOTIFIERS: Mutex<HashMap<usize, (FrameFetchedNotifierSender, FrameFetchedNotifierReceiver)>> = Mutex::new(HashMap::default());
+
+    // display_idx -> set of conn id.
+    // Used to record which connections need to be notified when
+    // 1. A new frame is received from a web client.
+    //   Because web client does not send the display index in message `VideoReceived`.
+    // 2. The client is closing.
+    static ref DISPLAY_CONN_IDS: Arc<Mutex<HashMap<usize, HashSet<i32>>>> = Default::default();
     pub static ref VIDEO_QOS: Arc<Mutex<VideoQoS>> = Default::default();
     pub static ref IS_UAC_RUNNING: Arc<Mutex<bool>> = Default::default();
     pub static ref IS_FOREGROUND_WINDOW_ELEVATED: Arc<Mutex<bool>> = Default::default();
+    static ref SCREENSHOTS: Mutex<HashMap<usize, Screenshot>> = Default::default();
+}
+
+struct Screenshot {
+    sid: String,
+    tx: Sender,
+    restore_vram: bool,
 }
 
 #[inline]
-pub fn notify_video_frame_fetched(conn_id: i32, frame_tm: Option<Instant>) {
-    FRAME_FETCHED_NOTIFIER.0.send((conn_id, frame_tm)).ok();
+pub fn notify_video_frame_fetched(display_idx: usize, conn_id: i32, frame_tm: Option<Instant>) {
+    if let Some(notifier) = FRAME_FETCHED_NOTIFIERS.lock().unwrap().get(&display_idx) {
+        notifier.0.send((conn_id, frame_tm)).ok();
+    }
+}
+
+#[inline]
+pub fn notify_video_frame_fetched_by_conn_id(conn_id: i32, frame_tm: Option<Instant>) {
+    let vec_display_idx: Vec<usize> = {
+        let display_conn_ids = DISPLAY_CONN_IDS.lock().unwrap();
+        display_conn_ids
+            .iter()
+            .filter_map(|(display_idx, conn_ids)| {
+                if conn_ids.contains(&conn_id) {
+                    Some(*display_idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let notifiers = FRAME_FETCHED_NOTIFIERS.lock().unwrap();
+    for display_idx in vec_display_idx {
+        if let Some(notifier) = notifiers.get(&display_idx) {
+            notifier.0.send((conn_id, frame_tm)).ok();
+        }
+    }
 }
 
 struct VideoFrameController {
+    display_idx: usize,
     cur: Instant,
     send_conn_ids: HashSet<i32>,
 }
 
 impl VideoFrameController {
-    fn new() -> Self {
+    fn new(display_idx: usize) -> Self {
         Self {
+            display_idx,
             cur: Instant::now(),
             send_conn_ids: HashSet::new(),
         }
@@ -98,6 +139,10 @@ impl VideoFrameController {
         if !conn_ids.is_empty() {
             self.cur = tm;
             self.send_conn_ids = conn_ids;
+            DISPLAY_CONN_IDS
+                .lock()
+                .unwrap()
+                .insert(self.display_idx, self.send_conn_ids.clone());
         }
     }
 
@@ -108,8 +153,20 @@ impl VideoFrameController {
         }
 
         let timeout_dur = Duration::from_millis(timeout_millis as u64);
-        match tokio::time::timeout(timeout_dur, FRAME_FETCHED_NOTIFIER.1.lock().await.recv()).await
-        {
+        let receiver = {
+            match FRAME_FETCHED_NOTIFIERS
+                .lock()
+                .unwrap()
+                .get(&self.display_idx)
+            {
+                Some(notifier) => notifier.1.clone(),
+                None => {
+                    return;
+                }
+            }
+        };
+        let mut receiver_guard = receiver.lock().await;
+        match tokio::time::timeout(timeout_dur, receiver_guard.recv()).await {
             Err(_) => {
                 // break if timeout
                 // log::error!("blocking wait frame receiving timeout {}", timeout_millis);
@@ -122,6 +179,14 @@ impl VideoFrameController {
             }
             Ok(None) => {
                 // this branch would never be reached
+            }
+        }
+        while !receiver_guard.is_empty() {
+            if let Some((id, instant)) = receiver_guard.recv().await {
+                if let Some(tm) = instant {
+                    log::trace!("Channel recv latency: {}", tm.elapsed().as_secs_f32());
+                }
+                fetched_conn_ids.insert(id);
             }
         }
     }
@@ -176,6 +241,14 @@ pub fn get_service_name(source: VideoSource, idx: usize) -> String {
 }
 
 pub fn new(source: VideoSource, idx: usize) -> GenericService {
+    let _ = FRAME_FETCHED_NOTIFIERS
+        .lock()
+        .unwrap()
+        .entry(idx)
+        .or_insert_with(|| {
+            let (tx, rx) = unbounded_channel();
+            (tx, Arc::new(TokioMutex::new(rx)))
+        });
     let vs = VideoService {
         sp: GenericService::new(get_service_name(source, idx), true),
         idx,
@@ -318,7 +391,7 @@ fn get_capturer_monitor(
     #[cfg(target_os = "linux")]
     {
         if !is_x11() {
-            return super::wayland::get_capturer();
+            return super::wayland::get_capturer_for_display(current);
         }
     }
 
@@ -457,7 +530,7 @@ fn get_capturer(
 }
 
 fn run(vs: VideoService) -> ResultType<()> {
-    let _raii = Raii::new(vs.sp.name());
+    let mut _raii = Raii::new(vs.idx, vs.sp.name());
     // Wayland only support one video capturer for now. It is ok to call ensure_inited() here.
     //
     // ensure_inited() is needed because clear() may be called.
@@ -466,11 +539,20 @@ fn run(vs: VideoService) -> ResultType<()> {
     #[cfg(target_os = "linux")]
     super::wayland::ensure_inited()?;
     #[cfg(target_os = "linux")]
-    let _wayland_call_on_ret = SimpleCallOnReturn {
-        b: true,
-        f: Box::new(|| {
-            super::wayland::clear();
-        }),
+    let _wayland_call_on_ret = {
+        // Increment active display count when starting
+        let _display_count = super::wayland::increment_active_display_count();
+
+        SimpleCallOnReturn {
+            b: true,
+            f: Box::new(|| {
+                // Decrement active display count and only clear if this was the last display
+                let remaining_count = super::wayland::decrement_active_display_count();
+                if remaining_count == 0 {
+                    super::wayland::clear();
+                }
+            }),
+        }
     };
 
     #[cfg(windows)]
@@ -547,7 +629,7 @@ fn run(vs: VideoService) -> ResultType<()> {
         sp.set_option_bool(OPTION_REFRESH, false);
     }
 
-    let mut frame_controller = VideoFrameController::new();
+    let mut frame_controller = VideoFrameController::new(display_idx);
 
     let start = time::Instant::now();
     let mut last_check_displays = time::Instant::now();
@@ -639,6 +721,49 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    let screenshot = SCREENSHOTS.lock().unwrap().remove(&display_idx);
+                    if let Some(mut screenshot) = screenshot {
+                        let restore_vram = screenshot.restore_vram;
+                        let (msg, w, h, data) = match &frame {
+                            scrap::Frame::PixelBuffer(f) => match get_rgba_from_pixelbuf(f) {
+                                Ok(rgba) => ("".to_owned(), f.width(), f.height(), rgba),
+                                Err(e) => {
+                                    let serr = e.to_string();
+                                    log::error!(
+                                        "Failed to convert the pix format into rgba, {}",
+                                        &serr
+                                    );
+                                    (format!("Convert pixfmt: {}", serr), 0, 0, vec![])
+                                }
+                            },
+                            scrap::Frame::Texture(_) => {
+                                if restore_vram {
+                                    // Already set one time, just ignore to break infinite loop.
+                                    // Though it's unreachable, this branch is kept to avoid infinite loop.
+                                    (
+                                        "Please change codec and try again.".to_owned(),
+                                        0,
+                                        0,
+                                        vec![],
+                                    )
+                                } else {
+                                    #[cfg(all(windows, feature = "vram"))]
+                                    VRamEncoder::set_not_use(sp.name(), true);
+                                    screenshot.restore_vram = true;
+                                    SCREENSHOTS.lock().unwrap().insert(display_idx, screenshot);
+                                    _raii.try_vram = false;
+                                    bail!("SWITCH");
+                                }
+                            }
+                        };
+                        std::thread::spawn(move || {
+                            handle_screenshot(screenshot, msg, w, h, data);
+                        });
+                        if restore_vram {
+                            bail!("SWITCH");
+                        }
+                    }
+
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
                     let send_conn_ids = handle_one_frame(
                         display_idx,
@@ -752,6 +877,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                 break;
             }
         }
+        DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
 
         let elapsed = now.elapsed();
         // may need to enable frame(timeout)
@@ -764,24 +890,35 @@ fn run(vs: VideoService) -> ResultType<()> {
     Ok(())
 }
 
-struct Raii(String);
+struct Raii {
+    display_idx: usize,
+    name: String,
+    try_vram: bool,
+}
 
 impl Raii {
-    fn new(name: String) -> Self {
+    fn new(display_idx: usize, name: String) -> Self {
         log::info!("new video service: {}", name);
         VIDEO_QOS.lock().unwrap().new_display(name.clone());
-        Raii(name)
+        Raii {
+            display_idx,
+            name,
+            try_vram: true,
+        }
     }
 }
 
 impl Drop for Raii {
     fn drop(&mut self) {
-        log::info!("stop video service: {}", self.0);
+        log::info!("stop video service: {}", self.name);
         #[cfg(feature = "vram")]
-        VRamEncoder::set_not_use(self.0.clone(), false);
+        if self.try_vram {
+            VRamEncoder::set_not_use(self.name.clone(), false);
+        }
         #[cfg(feature = "vram")]
         Encoder::update(scrap::codec::EncodingUpdate::Check);
-        VIDEO_QOS.lock().unwrap().remove_display(&self.0);
+        VIDEO_QOS.lock().unwrap().remove_display(&self.name);
+        DISPLAY_CONN_IDS.lock().unwrap().remove(&self.display_idx);
     }
 }
 
@@ -1205,4 +1342,78 @@ fn check_qos(
     }
     drop(video_qos);
     Ok(())
+}
+
+pub fn set_take_screenshot(display_idx: usize, sid: String, tx: Sender) {
+    SCREENSHOTS.lock().unwrap().insert(
+        display_idx,
+        Screenshot {
+            sid,
+            tx,
+            restore_vram: false,
+        },
+    );
+}
+
+// We need to this function, because the `stride` may be larger than `width * 4`.
+fn get_rgba_from_pixelbuf<'a>(pixbuf: &scrap::PixelBuffer<'a>) -> ResultType<Vec<u8>> {
+    let w = pixbuf.width();
+    let h = pixbuf.height();
+    let stride = pixbuf.stride();
+    let Some(s) = stride.get(0) else {
+        bail!("Invalid pixel buf stride.")
+    };
+
+    if *s == w * 4 {
+        let mut rgba = vec![];
+        scrap::convert(pixbuf, scrap::Pixfmt::RGBA, &mut rgba)?;
+        Ok(rgba)
+    } else {
+        let bgra = pixbuf.data();
+        let mut bit_flipped = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let i = s * y + 4 * x;
+                bit_flipped.extend_from_slice(&[bgra[i + 2], bgra[i + 1], bgra[i], bgra[i + 3]]);
+            }
+        }
+        Ok(bit_flipped)
+    }
+}
+
+fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, data: Vec<u8>) {
+    let mut response = ScreenshotResponse::new();
+    response.sid = screenshot.sid;
+    if msg.is_empty() {
+        if data.is_empty() {
+            response.msg = "Failed to take screenshot, please try again later.".to_owned();
+        } else {
+            fn encode_png(width: usize, height: usize, rgba: Vec<u8>) -> ResultType<Vec<u8>> {
+                let mut png = Vec::new();
+                let mut encoder =
+                    repng::Options::smallest(width as _, height as _).build(&mut png)?;
+                encoder.write(&rgba)?;
+                encoder.finish()?;
+                Ok(png)
+            }
+            match encode_png(w as _, h as _, data) {
+                Ok(png) => {
+                    response.data = png.into();
+                }
+                Err(e) => {
+                    response.msg = format!("Error encoding png: {}", e);
+                }
+            }
+        }
+    } else {
+        response.msg = msg;
+    }
+    let mut msg_out = Message::new();
+    msg_out.set_screenshot_response(response);
+    if let Err(e) = screenshot
+        .tx
+        .send((hbb_common::tokio::time::Instant::now(), Arc::new(msg_out)))
+    {
+        log::error!("Failed to send screenshot, {}", e);
+    }
 }
